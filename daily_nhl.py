@@ -1,8 +1,10 @@
 """
-MBM NHL daily runner (rebuild v1, frozen spec).
+MBM NHL daily runner (rebuild v2, frozen spec).
 - Refreshes current-season schedule/results + goalie boxscores from the NHL API
 - Projects starters (most-used goalie over last 10 team games) into pseudo rows
 - Boards upcoming games (2-day horizon), winner head only (totals benched)
+- v2: winner head is the three-way regulation/OT decomposition (see engine_nhl.fit_decomp).
+  The v1 binary is still fitted and logged as p_home_binary for side-by-side grading.
 - CALIBRATION GATE: value lines suppressed until EVERY team has 9+ GP
 - Grades logged predictions (no pushes: OT/SO included), last-300 tripwire
 Usage: python daily_nhl.py [--date YYYY-MM-DD]
@@ -146,10 +148,18 @@ def run(today_str):
         ["date", "game_id"]).reset_index(drop=True) if pseudo else g
     f = E.add_diffs(E.build(g_all, box, CFG))
     tr = (f.season >= TRAIN_LO) & (f.season <= TRAIN_HI) & f.hs.notna()
+
+    # v2 shipped head: three-way regulation / OT decomposition
+    fitted = E.fit_decomp(f, tr, C)
+    # v1 binary, fitted alongside purely so the grade block can show both
     sc = StandardScaler().fit(f.loc[tr, E.W].values)
-    mdl = LogisticRegression(C=C, max_iter=2000).fit(sc.transform(f.loc[tr, E.W].values),
-                                                     f.loc[tr, "y"].values)
+    mdl_bin = LogisticRegression(C=C, max_iter=2000).fit(sc.transform(f.loc[tr, E.W].values),
+                                                         f.loc[tr, "y"].values)
     base = float(f.loc[tr, "y"].mean())
+    past_reg_rate = float(f.loc[tr, "past_reg"].mean())
+    print(f"head v2: q(home wins past regulation)={fitted[2]:.4f}  "
+          f"past-regulation rate in train={past_reg_rate:.4f}  n_train={int(tr.sum())}")
+
     gp = g[(g.season == season) & g.hs.notna()]
     counts = pd.concat([gp.home, gp.away]).value_counts()
     gate_open = len(counts) >= 32 and counts.min() >= CAL_MIN_GP
@@ -158,37 +168,50 @@ def run(today_str):
     os.makedirs(LOGS, exist_ok=True)
     pred_path = os.path.join(LOGS, "predictions.csv")
     log = pd.read_csv(pred_path, dtype={"game_id": str}) if os.path.exists(pred_path) else \
-        pd.DataFrame(columns=["date", "game_id", "season", "home", "away", "p_home", "p_elo", "model"])
+        pd.DataFrame(columns=["date", "game_id", "season", "home", "away", "p_home",
+                              "p_home_binary", "p_elo", "model"])
+    if "p_home_binary" not in log.columns:
+        log["p_home_binary"] = np.nan          # v1 rows predate the decomposition
 
     board = None
     if len(up):
         rows = f[f.game_id.isin(up.game_id)].copy()
-        p = mdl.predict_proba(sc.transform(rows[E.W].values))[:, 1]
+        p = E.predict_decomp(fitted, rows[E.W].values)
+        p_bin = mdl_bin.predict_proba(sc.transform(rows[E.W].values))[:, 1]
         pe = 1/(1+10**(-((rows.h_elo + CFG["HA"]) - rows.a_elo)/400))
         board = pd.DataFrame({"date": pd.to_datetime(rows.date).dt.strftime("%Y-%m-%d"),
                               "game_id": rows.game_id.astype(str), "season": season,
                               "home": rows.home, "away": rows.away, "p_home": p,
-                              "p_elo": pe.values, "model": "v1"})
+                              "p_home_binary": p_bin, "p_elo": pe.values, "model": "v2-decomp"})
         log = pd.concat([log[~log.game_id.isin(board.game_id)], board], ignore_index=True)
         gate_txt = "" if gate_open else f"  [CALIBRATION: no betting until every team has {CAL_MIN_GP} GP]"
         print(f"\n=== MBM NHL board ==={gate_txt}")
         for _, r in board.iterrows():
             vals = (f"value: {r.home} >= {min_odds(r.p_home):.2f} / {r.away} >= {min_odds(1-r.p_home):.2f}"
                     if gate_open else "CALIBRATION: predictions only")
-            print(f"{r.away:>3} @ {r.home:<3}  p(home)={r.p_home:.3f}  (elo {r.p_elo:.3f})  | {vals}")
+            print(f"{r.away:>3} @ {r.home:<3}  p(home)={r.p_home:.3f}  "
+                  f"(binary {r.p_home_binary:.3f}, elo {r.p_elo:.3f})  | {vals}")
     else:
         print("no games in the next 2 days")
 
     fin = g.assign(gid=g.game_id.astype(str)).set_index("gid")
     log["result"] = log.game_id.map((fin.hs > fin.as_).astype(float).where(fin.hs.notna()))
+    log = log[["date", "game_id", "season", "home", "away", "p_home", "p_home_binary",
+               "p_elo", "model", "result"]]
     log.to_csv(pred_path, index=False)
+
     dec = log[log.result.notna()]
     if len(dec) >= 30:
         y = dec.result.astype(int).values
         print(f"\nrolling grade (n={len(y)}):")
-        for lbl, pp in (("model v1 ", dec.p_home), ("elo floor", dec.p_elo),
-                        ("base rate", pd.Series(np.full(len(y), base)))):
-            pc = np.clip(pp.values.astype(float), 1e-6, 1-1e-6)
+        series = [("v2 decomp", dec.p_home), ("v1 binary", dec.p_home_binary),
+                  ("elo floor", dec.p_elo), ("base rate", pd.Series(np.full(len(y), base)))]
+        for lbl, pp in series:
+            v = pp.values.astype(float)
+            if not np.isfinite(v).all():
+                print(f"{lbl}: n/a for {int((~np.isfinite(v)).sum())} rows logged before v2")
+                continue
+            pc = np.clip(v, 1e-6, 1-1e-6)
             print(f"{lbl}: LL={log_loss(y, pc):.4f}  Brier={brier_score_loss(y, pc):.4f}  "
                   f"hit={np.mean((pc > .5) == (y == 1)):.3f}")
         w = dec.tail(300)
