@@ -19,6 +19,8 @@ from sklearn.metrics import log_loss, brier_score_loss
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, HERE)
+import tg_delta
+import board_format as BF
 import engine_nhl as E
 
 H = {"User-Agent": "Mozilla/5.0"}
@@ -226,16 +228,28 @@ def run(today_str):
 
     tg, ch = os.environ.get("TG_TOKEN"), os.environ.get("TG_CHAT")
     if tg and ch and (board is not None or alerts):
+        push, skipped = {}, 0
         if board is not None:
-            lines = []
-            for _, r in board.iterrows():
-                if gate_open:
-                    lines.append(f"{r.away} @ {r.home}: {r.p_home:.3f} | {r.home} >= {min_odds(r.p_home):.2f} / {r.away} >= {min_odds(1-r.p_home):.2f}")
-                else:
-                    lines.append(f"{r.away} @ {r.home}: {r.p_home:.3f} | CALIBRATION, no betting")
-            txt = "\n".join(lines)
-        else:
-            txt = "no games today"
+            rows = [(today_str, f"{r.away} @ {r.home}",
+                     r.home if r.p_home >= .5 else r.away,
+                     max(r.p_home, 1 - r.p_home), r.game_id) for _, r in board.iterrows()]
+            wg = max([len(x[1]) for x in rows] + [10]); wp = max([len(x[2]) for x in rows] + [8])
+            for d_, gm, pk, q, gid in rows:
+                if gate_open and BF.min_odds(q) < BF.PRICE_FLOOR:
+                    skipped += 1
+                    continue
+                ln = (BF.line(d_, gm, pk, q, w_game=wg, w_pick=wp) if gate_open
+                      else f"{d_}  {gm:<{wg}} {pk:<{wp}} CALIBRATION, no betting")
+                push[gid] = {"line": ln, "min_odds": BF.min_odds(q)}
+        mode, lines = tg_delta.gate(LOGS, today_str.replace("-", ""), push)
+        if not (lines or alerts):
+            return
+        txt = "\n".join(lines) if lines else "no price changes since the last push"
+        if skipped:
+            txt += f"\n({skipped} game{'s' if skipped != 1 else ''} skipped, "\
+                   f"price floor {BF.PRICE_FLOOR:.2f} / {BF.american(BF.PRICE_FLOOR)})"
+        if mode == "delta" and lines:
+            txt = "changes since the last push:\n" + txt
         if alerts:
             txt += "\n\u26a0 TRIPWIRE: " + ", ".join(alerts) + " below base rate, stop betting this board"
         requests.post(f"https://api.telegram.org/bot{tg}/sendMessage",
