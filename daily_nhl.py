@@ -188,7 +188,7 @@ def run(today_str):
                               "p_home_binary": p_bin, "p_elo": pe.values, "model": "v2-decomp"})
         log = pd.concat([log[~log.game_id.isin(board.game_id)], board], ignore_index=True)
         gate_txt = "" if gate_open else f"  [CALIBRATION: no betting until every team has {CAL_MIN_GP} GP]"
-        print(f"\n=== MBM NHL board ==={gate_txt}")
+        print("\n--- NHL detail: model margin, total ---")
         for _, r in board.iterrows():
             vals = (f"value: {r.home} >= {min_odds(r.p_home):.2f} / {r.away} >= {min_odds(1-r.p_home):.2f}"
                     if gate_open else "CALIBRATION: predictions only")
@@ -241,6 +241,13 @@ def run(today_str):
                 ln = (BF.line(d_, gm, pk, q, w_game=wg, w_pick=wp) if gate_open
                       else f"{d_}  {gm:<{wg}} {pk:<{wp}} CALIBRATION, no betting")
                 push[gid] = {"line": ln, "min_odds": BF.min_odds(q)}
+        print("\n=== MBM NHL board ===")
+        for _v in push.values():
+            print(_v["line"])
+        if skipped:
+            print(f"({skipped} game{{'s' if skipped != 1 else ''}} skipped, "
+                  f"price floor {{BF.PRICE_FLOOR:.2f}} / {{BF.american(BF.PRICE_FLOOR)}})")
+
         mode, lines = tg_delta.gate(LOGS, today_str.replace("-", ""), push)
         if not (lines or alerts):
             return
