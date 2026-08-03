@@ -3,6 +3,7 @@ MBM NHL daily runner (rebuild v2, frozen spec).
 - Refreshes current-season schedule/results + goalie boxscores from the NHL API
 - Projects starters (most-used goalie over last 10 team games) into pseudo rows
 - Boards upcoming games (2-day horizon), winner head only (totals benched)
+- Discord push routed through tg_delta so refreshes only report what moved
 - v2: winner head is the three-way regulation/OT decomposition (see engine_nhl.fit_decomp).
   The v1 binary is still fitted and logged as p_home_binary for side-by-side grading.
 - CALIBRATION GATE: value lines suppressed until EVERY team has 9+ GP
@@ -24,6 +25,16 @@ import board_format as BF
 import notify
 import engine_nhl as E
 
+# Shared files must be at least this new. A minimum rather than an exact match, so a later
+# improvement to a shared file does not force an edit here.
+SHARED_MIN = "2026-08-03"
+for _mod in (BF, notify, tg_delta):
+    _have = getattr(_mod, "VERSION", "")
+    if _have < SHARED_MIN:
+        raise ImportError(
+            f"{_mod.__name__}.py is version {_have or 'unstamped'}, this runner needs "
+            f"{SHARED_MIN} or newer. Copy the current shared files into this repo.")
+
 H = {"User-Agent": "Mozilla/5.0"}
 API = "https://api-web.nhle.com/v1"
 GAMES = os.path.join(HERE, "data", "games.csv")
@@ -32,7 +43,8 @@ LOGS = os.path.join(HERE, "logs")
 SPEC = json.load(open(os.path.join(HERE, "spec.json")))
 CFG, C = SPEC["cfg"], SPEC["C"]
 TRAIN_LO, TRAIN_HI = 2018, 2025
-CAL_MIN_GP = 9
+CAL_MIN_GP = SPEC.get("cal_min_gp", 9)
+HORIZON_DAYS = SPEC.get("horizon_days", 2)
 MIN_EDGE = 0.05
 TEAMS = ["ANA","BOS","BUF","CGY","CAR","CHI","COL","CBJ","DAL","DET","EDM","FLA","LAK","MIN","MTL",
          "NSH","NJD","NYI","NYR","OTT","PHI","PIT","SJS","SEA","STL","TBL","TOR","UTA","VAN","VGK","WPG","WSH"]
@@ -70,7 +82,7 @@ def refresh_games(season, today):
     if len(cur):
         cur["date"] = pd.to_datetime(cur.date)
         done = cur[cur.hs.notna() & cur.as_.notna()]
-        up = cur[cur.hs.isna() & (cur.date >= today) & (cur.date <= today + pd.Timedelta(days=2))]
+        up = cur[cur.hs.isna() & (cur.date >= today) & (cur.date <= today + pd.Timedelta(days=HORIZON_DAYS))]
         if len(done):
             g = pd.concat([g[~g.game_id.isin(done.game_id)], done], ignore_index=True)
             g = g.sort_values(["date", "game_id"]).reset_index(drop=True)
@@ -166,6 +178,7 @@ def run(today_str):
     gp = g[(g.season == season) & g.hs.notna()]
     counts = pd.concat([gp.home, gp.away]).value_counts()
     gate_open = len(counts) >= 32 and counts.min() >= CAL_MIN_GP
+    min_gp = int(counts.min()) if len(counts) >= 32 else 0
 
     alerts = []
     os.makedirs(LOGS, exist_ok=True)
@@ -175,6 +188,12 @@ def run(today_str):
                               "p_home_binary", "p_elo", "model"])
     if "p_home_binary" not in log.columns:
         log["p_home_binary"] = np.nan          # v1 rows predate the decomposition
+    # On a v1 row the binary WAS the published forecast, so p_home already holds it. Filling
+    # the column makes that explicit rather than leaving it blank for every consumer of this
+    # file, including the dashboard. A definitional fill, not a revision: no number changes.
+    _v1 = log.model.astype(str).str.startswith("v1")
+    log.loc[_v1 & log.p_home_binary.isna(), "p_home_binary"] = log.loc[
+        _v1 & log.p_home_binary.isna(), "p_home"]
 
     board = None
     if len(up):
@@ -195,7 +214,7 @@ def run(today_str):
             print(f"{r.away:>3} @ {r.home:<3}  p(home)={r.p_home:.3f}  "
                   f"(binary {r.p_home_binary:.3f}, elo {r.p_elo:.3f})  | {vals}")
     else:
-        print("no games in the next 2 days")
+        print(f"no games in the next {HORIZON_DAYS} days")
 
     fin = g.assign(gid=g.game_id.astype(str)).set_index("gid")
     log["result"] = log.game_id.map((fin.hs > fin.as_).astype(float).where(fin.hs.notna()))
@@ -207,7 +226,13 @@ def run(today_str):
     if len(dec) >= 30:
         y = dec.result.astype(int).values
         print(f"\nrolling grade (n={len(y)}):")
-        series = [("v2 decomp", dec.p_home), ("v1 binary", dec.p_home_binary),
+        # `p_home` is whatever this board published at the time: v1's binary across the
+        # backfill, v2's decomposition from 2026-07-26 on. Grading it as one series and
+        # labelling that series "v2 decomp" would credit v2 with thousands of games it
+        # never forecast, so it is labelled for what it is. The v2-only comparison is
+        # printed separately below, once v2 has a window of its own.
+        is_v1 = dec.model.astype(str).str.startswith("v1").values
+        series = [("published", dec.p_home), ("v1 binary", dec.p_home_binary),
                   ("elo floor", dec.p_elo), ("base rate", pd.Series(np.full(len(y), base)))]
         for lbl, pp in series:
             v = pp.values.astype(float)
@@ -217,52 +242,84 @@ def run(today_str):
             pc = np.clip(v, 1e-6, 1-1e-6)
             print(f"{lbl}: LL={log_loss(y, pc):.4f}  Brier={brier_score_loss(y, pc):.4f}  "
                   f"hit={np.mean((pc > .5) == (y == 1)):.3f}")
+        # v2 against v1 on the rows v2 actually forecast. Both columns are populated on
+        # those rows, so this is a paired comparison rather than two different windows.
+        v2 = dec[~is_v1]
+        if len(v2) >= 100:
+            yv = v2.result.astype(int).values
+            pv = np.clip(v2.p_home.values.astype(float), 1e-6, 1-1e-6)
+            pb = np.clip(v2.p_home_binary.values.astype(float), 1e-6, 1-1e-6)
+            if np.isfinite(pb).all():
+                print(f"v2 vs v1, live only (n={len(v2)}): v2 LL={log_loss(yv, pv):.4f}  "
+                      f"v1 LL={log_loss(yv, pb):.4f}  gain {log_loss(yv, pb)-log_loss(yv, pv):+.4f}")
+        else:
+            print(f"v2 has forecast {int((~is_v1).sum())} graded games; "
+                  f"the side-by-side needs 100")
+
         w = dec.tail(300)
         if len(w) >= 300:
             yy = w.result.astype(int).values
             edge = log_loss(yy, np.full(len(yy), base)) - \
                 log_loss(yy, np.clip(w.p_home.values.astype(float), 1e-6, 1-1e-6))
-            print(f"last-300 edge vs base: {edge:+.4f}  [{'OK' if edge > 0 else 'TRIPWIRE: bench review'}]")
+            n_v1 = int(pd.Series(w.model.astype(str).str.startswith("v1")).sum())
+            mix = f", {n_v1} of them v1 backfill" if n_v1 else ""
+            print(f"last-300 published edge vs base: {edge:+.4f}{mix}  "
+                  f"[{'OK' if edge > 0 else 'TRIPWIRE: bench review'}]")
             if edge <= 0:
                 alerts.append("NHL winner")
         dec.to_csv(os.path.join(LOGS, "graded.csv"), index=False)
 
-    if True:
-        push, skipped = {}, 0
-        if board is not None:
-            rows = [(today_str, f"{r.away} @ {r.home}",
-                     r.home if r.p_home >= .5 else r.away,
-                     max(r.p_home, 1 - r.p_home), r.game_id) for _, r in board.iterrows()]
-            wg = max([len(x[1]) for x in rows] + [10]); wp = max([len(x[2]) for x in rows] + [8])
-            for d_, gm, pk, q, gid in rows:
-                if gate_open and BF.min_odds(q) < BF.PRICE_FLOOR:
-                    skipped += 1
-                    continue
-                ln = (BF.line(d_, gm, pk, q, w_game=wg, w_pick=wp) if gate_open
-                      else f"{d_}  {gm:<{wg}} {pk:<{wp}} CALIBRATION, no betting")
-                push[gid] = {"line": ln, "min_odds": BF.min_odds(q)}
-        print("\n=== MBM NHL board ===")
-        for _v in push.values():
-            print(_v["line"])
-        if skipped:
-            print(f"({skipped} game{{'s' if skipped != 1 else ''}} skipped, "
-                  f"price floor {{BF.PRICE_FLOOR:.2f}} / {{BF.american(BF.PRICE_FLOOR)}})")
+    push, skipped, cal_n = {}, 0, 0
+    if board is not None:
+        bd = [(today_str, f"{r.away} @ {r.home}",
+               r.home if r.p_home >= .5 else r.away,
+               max(r.p_home, 1 - r.p_home), r.game_id) for _, r in board.iterrows()]
+        wg = max([len(x[1]) for x in bd] + [10]); wp = max([len(x[2]) for x in bd] + [8])
+        for d_, gm, pk, q, gid in bd:
+            if gate_open and BF.min_odds(q) < BF.PRICE_FLOOR:
+                skipped += 1
+                continue
+            if gate_open:
+                ln = BF.line(d_, gm, pk, q, w_game=wg, w_pick=wp)
+            else:
+                # Built to match notify's HEADER rule rather than BOARD, because there is
+                # no price on this row and there must not appear to be one. Padding it
+                # into BF.line's column layout without the "find X or better" tail matched
+                # no regex at all and rendered as a run-on line.
+                ln = (f"{d_}  {gm}  ·  calibration, {pk} {q:.1%}, gate opens at "
+                      f"{CAL_MIN_GP} GP (lowest now {min_gp})")
+                cal_n += 1
+            push[gid] = {"line": ln, "min_odds": BF.min_odds(q),
+                         # Carries the pick, so a goalie change flipping the side is
+                         # reported even when the price barely moves.
+                         "match": pk}
+    print("\n=== MBM NHL board ===")
+    for _v in push.values():
+        print(_v["line"])
+    if skipped:
+        print(f"({skipped} game{'s' if skipped != 1 else ''} skipped, "
+              f"price floor {BF.PRICE_FLOOR:.2f} / {BF.american(BF.PRICE_FLOOR)})")
 
-        mode, lines = tg_delta.gate(LOGS, today_str.replace("-", ""), push)
-        if not (lines or alerts):
-            return
+    mode, lines = tg_delta.gate(LOGS, today_str.replace("-", ""), push)
+    if lines or alerts:
         body = list(lines) if lines else ["no price changes since the last push"]
         foot = (f"{skipped} game{'s' if skipped != 1 else ''} skipped, "
                 f"price floor {BF.PRICE_FLOOR:.2f} / {BF.american(BF.PRICE_FLOOR)}")\
                if skipped else None
         title = "MBM NHL" + (" · changes since the last push"
-                                 if mode == "delta" and lines else "")
-        colour = notify.GREEN
+                             if mode == "delta" and lines else "")
+        # GREY is the calibration colour. The gate here is all-or-nothing on games played,
+        # so a board is either entirely inside the window or entirely out of it.
+        colour = notify.GREY if push and cal_n == len(push) else notify.GREEN
         if alerts:
             body = body + ["", "TRIPWIRE: " + ", ".join(alerts)
                            + " below base rate, stop betting this board"]
             colour = notify.RED
         notify.send(title, body, foot, colour)
+    elif not push:
+        print("no board to send")
+    else:
+        print("board unchanged since the last push, nothing sent")
 
 if __name__ == "__main__":
     ap = argparse.ArgumentParser()
