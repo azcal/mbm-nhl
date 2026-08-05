@@ -45,7 +45,10 @@ CFG, C = SPEC["cfg"], SPEC["C"]
 TRAIN_LO, TRAIN_HI = 2018, 2025
 CAL_MIN_GP = SPEC.get("cal_min_gp", 9)
 HORIZON_DAYS = SPEC.get("horizon_days", 2)
-MIN_EDGE = 0.05
+# Tracks board_format rather than restating it. This is the console-side copy, and a
+# local 0.05 here while board_format ran at 0.00 meant the Actions log and Discord
+# quoted different prices for the same game.
+MIN_EDGE = BF.MIN_EDGE
 TEAMS = ["ANA","BOS","BUF","CGY","CAR","CHI","COL","CBJ","DAL","DET","EDM","FLA","LAK","MIN","MTL",
          "NSH","NJD","NYI","NYR","OTT","PHI","PIT","SJS","SEA","STL","TBL","TOR","UTA","VAN","VGK","WPG","WSH"]
 
