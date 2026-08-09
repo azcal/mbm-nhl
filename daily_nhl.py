@@ -22,13 +22,14 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, HERE)
 import tg_delta
 import board_format as BF
+import freshness as FR
 import notify
 import engine_nhl as E
 
 # Shared files must be at least this new. A minimum rather than an exact match, so a later
 # improvement to a shared file does not force an edit here.
 SHARED_MIN = "2026-08-03"
-for _mod in (BF, notify, tg_delta):
+for _mod in (BF, notify, tg_delta, FR):
     _have = getattr(_mod, "VERSION", "")
     if _have < SHARED_MIN:
         raise ImportError(
@@ -131,7 +132,49 @@ def refresh_box(g, box, season):
     print(f"goalie boxscores added: {len(need)}")
     return box
 
-def projected_starters(g, box):
+def fetch_rosters(season, timeout=25):
+    """team -> set of goalie ids currently on the roster.
+
+    api-web.nhle.com/v1/roster/{TEAM}/{SEASON} splits forwards, defensemen and goalies, so
+    this is a direct answer to who could start tonight. Empty on any failure, and the
+    caller falls back to usage alone rather than boarding nothing.
+
+    There is deliberately no confirmed-starter call here: the official API has none. The
+    boxscore carries goalies but its `starter` field is null and only populates after the
+    game, and gameInfo has scratches and coaches, nothing pregame. Confirmed starters exist
+    only on third-party sites, and a scrape of one is a worse dependency than the gap it
+    closes.
+    """
+    out = {}
+    for tm in TEAMS:
+        try:
+            # season_code returns a single start year; this endpoint wants the pair.
+            r = requests.get(f"https://api-web.nhle.com/v1/roster/{tm}/{season}{season+1}",
+                             timeout=timeout)
+            if r.status_code != 200:
+                continue
+            ids = {int(p["id"]) for p in r.json().get("goalies", []) if p.get("id")}
+            if ids:
+                out[tm] = ids
+        except Exception:
+            continue
+    if out:
+        print(f"rosters: {len(out)} teams, "
+              f"{sum(len(v) for v in out.values())} goalies")
+    else:
+        print("roster feed unavailable, projecting on usage alone")
+    return out
+
+
+def projected_starters(g, box, rosters=None):
+    """Most-used goalie over the team's last ten games, constrained to the roster.
+
+    Usage alone was wrong in both directions across a trade: a goalie who has just arrived
+    appears in none of his new team's last ten and can never be projected, while he is
+    still in his old team's ten and can be projected for a team he has left. Intersecting
+    with the roster fixes both at once. Usage still picks between the goalies who are
+    actually there, which is the part it is good at.
+    """
     proj = {}
     done = g[g.hs.notna()].sort_values("date")
     for tm in set(done.home) | set(done.away):
@@ -144,6 +187,23 @@ def projected_starters(g, box):
             lst = b["h"] if r.home == tm else b["a"]
             if lst:
                 starters.append(max(lst, key=lambda x: x[1])[0])
+        keep = (rosters or {}).get(tm)
+        if keep:
+            elig = [x for x in starters if x in keep]
+            if elig:
+                starters = elig
+            elif starters:
+                # Everyone who has been starting has left. Fall back to the roster's most
+                # experienced goalie rather than naming one who plays elsewhere now.
+                counts = Counter()
+                for r in done[(done.home == tm) | (done.away == tm)].tail(60).itertuples():
+                    b = box.get(int(r.game_id))
+                    if not b:
+                        continue
+                    for pid, _mins in (b["h"] if r.home == tm else b["a"]):
+                        if pid in keep:
+                            counts[pid] += 1
+                starters = [counts.most_common(1)[0][0]] if counts else list(keep)[:1]
         if starters:
             proj[tm] = Counter(starters).most_common(1)[0][0]
     return proj
@@ -153,7 +213,17 @@ def run(today_str):
     season = season_code(today)
     g, up = refresh_games(season, today)
     box = refresh_box(g, load_box(), season)
-    proj = projected_starters(g, box)
+
+    # Refuse to price tonight on a history the source knows is incomplete. This is not an
+    # "is it today's data" test: a league that did not play yesterday is current with old
+    # data. It asks whether any completed game exists that this history has not seen.
+    _newest = pd.to_datetime(g[g.hs.notna()].date).max().date()
+    _miss, _ = FR.missed_games("hockey/nhl", _newest)
+    FR.guard("NHL", _newest, "hockey/nhl")
+    FRESH_LINE = FR.board_line(_newest, checked=(_newest, _miss))
+    SEASON_LINE = None
+
+    proj = projected_starters(g, box, fetch_rosters(season))
 
     pseudo = []
     for r in up.itertuples():
@@ -318,6 +388,9 @@ def run(today_str):
             body = body + ["", "TRIPWIRE: " + ", ".join(alerts)
                            + " below base rate, stop betting this board"]
             colour = notify.RED
+        # The board carries its own provenance. A reader should not have to trust that
+        # the data was current; the row says so.
+        foot = " · ".join([x for x in (FRESH_LINE, SEASON_LINE, foot) if x])
         notify.send(title, body, foot, colour)
     elif not push:
         print("no board to send")
