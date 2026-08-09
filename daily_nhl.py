@@ -192,18 +192,29 @@ def projected_starters(g, box, rosters=None):
             elig = [x for x in starters if x in keep]
             if elig:
                 starters = elig
-            elif starters:
-                # Everyone who has been starting has left. Fall back to the roster's most
-                # experienced goalie rather than naming one who plays elsewhere now.
-                counts = Counter()
-                for r in done[(done.home == tm) | (done.away == tm)].tail(60).itertuples():
-                    b = box.get(int(r.game_id))
-                    if not b:
+            else:
+                # Nobody who has been starting for this team is still on its roster, which
+                # happens in an offseason when both goalies move. Fall back to whichever
+                # roster goalie has played most recently ANYWHERE, which is the same
+                # league-wide lookup the basketball boards use: a goalie traded in has no
+                # minutes for this team but plenty for his last one.
+                last_seen = {}
+                for r2 in done.itertuples():
+                    b2 = box.get(int(r2.game_id))
+                    if not b2:
                         continue
-                    for pid, _mins in (b["h"] if r.home == tm else b["a"]):
-                        if pid in keep:
-                            counts[pid] += 1
-                starters = [counts.most_common(1)[0][0]] if counts else list(keep)[:1]
+                    for ent in list(b2["h"]) + list(b2["a"]):
+                        if ent and ent[0] in keep:
+                            last_seen[ent[0]] = r2.date
+                if last_seen:
+                    pick = max(last_seen, key=lambda k: last_seen[k])
+                else:
+                    # Nothing on record for any of them. Sorted, so the same run twice
+                    # gives the same answer; set ordering would not.
+                    pick = sorted(keep)[0]
+                print(f"  {tm}: no recent starter still on the roster, "
+                      f"projecting {pick}")
+                starters = [pick]
         if starters:
             proj[tm] = Counter(starters).most_common(1)[0][0]
     return proj
