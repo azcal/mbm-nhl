@@ -80,13 +80,17 @@ def refresh_games(season, today):
                     hs=x["homeTeam"].get("score"), as_=x["awayTeam"].get("score"),
                     endtype=(x.get("gameOutcome") or {}).get("lastPeriodType"),
                     neutral=bool(x.get("neutralSite")), utc=x.get("startTimeUTC"),
-                    season=season)
+                    state=x.get("gameState"), season=season)
     cur = pd.DataFrame(rows.values())
     done, up = pd.DataFrame(), pd.DataFrame()
     if len(cur):
         cur["date"] = pd.to_datetime(cur.date)
         done = cur[cur.hs.notna() & cur.as_.notna()]
-        up = cur[cur.hs.isna() & (cur.date >= today) & (cur.date <= today + pd.Timedelta(days=HORIZON_DAYS))]
+        # FUT only. Keying on a missing score would board a game currently being played:
+        # it has no final score either, and a pre-game price on a live game is worthless.
+        # LIVE and CRIT are in progress, OFF and FINAL are done.
+        _pre = cur.state.eq("FUT") if "state" in cur.columns else cur.hs.isna()
+        up = cur[_pre & (cur.date >= today) & (cur.date <= today + pd.Timedelta(days=HORIZON_DAYS))]
         if len(done):
             g = pd.concat([g[~g.game_id.isin(done.game_id)], done], ignore_index=True)
             g = g.sort_values(["date", "game_id"]).reset_index(drop=True)
