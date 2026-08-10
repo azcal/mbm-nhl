@@ -23,13 +23,14 @@ sys.path.insert(0, HERE)
 import tg_delta
 import board_format as BF
 import freshness as FR
+import mbm_checks as CHK
 import notify
 import engine_nhl as E
 
 # Shared files must be at least this new. A minimum rather than an exact match, so a later
 # improvement to a shared file does not force an edit here.
 SHARED_MIN = "2026-08-03"
-for _mod in (BF, notify, tg_delta, FR):
+for _mod in (BF, notify, tg_delta, FR, CHK):
     _have = getattr(_mod, "VERSION", "")
     if _have < SHARED_MIN:
         raise ImportError(
@@ -224,6 +225,7 @@ def projected_starters(g, box, rosters=None):
     return proj
 
 def run(today_str):
+    chk = CHK.Reporter("NHL", today_str)
     today = pd.Timestamp(today_str)
     season = season_code(today)
     g, up = refresh_games(season, today)
@@ -233,8 +235,8 @@ def run(today_str):
     # "is it today's data" test: a league that did not play yesterday is current with old
     # data. It asks whether any completed game exists that this history has not seen.
     _newest = pd.to_datetime(g[g.hs.notna()].date).max().date()
-    _miss, _ = FR.missed_games("hockey/nhl", _newest)
-    FR.guard("NHL", _newest, "hockey/nhl")
+    _miss, _, _probe_failed = FR.missed_games("hockey/nhl", _newest)
+    FR.guard("NHL", _newest, "hockey/nhl", grace_days=1, reporter=chk)
     FRESH_LINE = FR.board_line(_newest, checked=(_newest, _miss))
     SEASON_LINE = None
 
@@ -308,6 +310,7 @@ def run(today_str):
     log["result"] = log.game_id.map((fin.hs > fin.as_).astype(float).where(fin.hs.notna()))
     log = log[["date", "game_id", "season", "home", "away", "p_home", "p_home_binary",
                "p_elo", "model", "result"]]
+    chk.finish(strict=True, require=["freshness"])
     log.to_csv(pred_path, index=False)
 
     dec = log[log.result.notna()]
