@@ -50,6 +50,7 @@ def load():
         d = J.loads(line); box[d["gid"]] = d
     return g.sort_values(["date", "game_id"]).reset_index(drop=True), box
 
+PROJECT_STARTERS = True
 def build(g, box, cfg):
     K, HA, CARRY, OTW, HLF, HLS, GTAU, GCARRY = (cfg["K"], cfg["HA"], cfg["carry"], cfg["otw"],
                                                  cfg["hl_f"], cfg["hl_s"], cfg["g_tau"], cfg["g_carry"])
@@ -73,6 +74,15 @@ def build(g, box, cfg):
         def starter(lst):
             return max(lst, key=lambda x: x[1])[0] if lst else None
         h_st, a_st = starter(hg_list), starter(ag_list)
+        if PROJECT_STARTERS:
+            # PREGAME (2026-09-24): the starter is the goalie most used over the team's last ten
+            # games, the same rule the live runner applies, so gk_d and the backup flag mean the
+            # same thing in training and on the board. The actual starter (max TOI in this
+            # game's box) was a lookahead worth 0.0004 to 0.0020 log loss and it fitted a
+            # backup flag that fires on 36-45% of holdout games and about 6% of live ones.
+            from collections import Counter as _C
+            h_st = _C(recent_gk[r.home]).most_common(1)[0][0] if recent_gk[r.home] else None
+            a_st = _C(recent_gk[r.away]).most_common(1)[0][0] if recent_gk[r.away] else None
         lsv = lg_sv.sx/max(lg_sv.sw, 1) if lg_sv.sw > 100 else 0.905
         def grate(pid, tm):
             if pid is None or pid not in gk:
