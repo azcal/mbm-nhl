@@ -2,7 +2,7 @@
 MBM NHL daily runner (rebuild v2, frozen spec).
 - Refreshes current-season schedule/results + goalie boxscores from the NHL API
 - Projects starters (most-used goalie over last 10 team games) into pseudo rows
-- Boards upcoming games (2-day horizon), winner head only (totals benched)
+- Boards upcoming games (today and tomorrow), winner head only (totals benched)
 - Discord push routed through tg_delta so refreshes only report what moved
 - v2: winner head is the three-way regulation/OT decomposition (see engine_nhl.fit_decomp).
   The v1 binary is still fitted and logged as p_home_binary for side-by-side grading.
@@ -46,7 +46,7 @@ SPEC = json.load(open(os.path.join(HERE, "spec.json")))
 CFG, C = SPEC["cfg"], SPEC["C"]
 TRAIN_LO, TRAIN_HI = 2018, 2025
 CAL_MIN_GP = SPEC.get("cal_min_gp", 9)
-HORIZON_DAYS = SPEC.get("horizon_days", 2)
+HORIZON_DAYS = SPEC.get("horizon_days", 1)   # today and tomorrow, nothing further out
 # Tracks board_format rather than restating it. This is the console-side copy, and a
 # local 0.05 here while board_format ran at 0.00 meant the Actions log and Discord
 # quoted different prices for the same game.
@@ -362,9 +362,12 @@ def run(today_str):
 
     push, skipped, cal_n = {}, 0, 0
     if board is not None:
-        bd = [(today_str, f"{r.away} @ {r.home}",
+        # Each row carries its own game date (the league's local date). Every row used to be
+        # stamped with the run date, so tomorrow's games read as tonight's. Sorted by date so
+        # tonight lists first and tomorrow after it.
+        bd = [(str(r.date)[:10], f"{r.away} @ {r.home}",
                r.home if r.p_home >= .5 else r.away,
-               max(r.p_home, 1 - r.p_home), r.game_id) for _, r in board.iterrows()]
+               max(r.p_home, 1 - r.p_home), r.game_id) for _, r in board.sort_values(["date", "game_id"]).iterrows()]
         wg = max([len(x[1]) for x in bd] + [10]); wp = max([len(x[2]) for x in bd] + [8])
         for d_, gm, pk, q, gid in bd:
             if gate_open and BF.min_odds(q) < BF.PRICE_FLOOR:

@@ -10,6 +10,6 @@
   "g_carry": 0.85
  },
  "C": 0.2,
- "horizon_days": 2,
+ "horizon_days": 1,
  "cal_min_gp": 9
 }
