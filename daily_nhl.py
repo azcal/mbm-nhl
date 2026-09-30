@@ -365,11 +365,21 @@ def run(today_str):
         # Each row carries its own game date (the league's local date). Every row used to be
         # stamped with the run date, so tomorrow's games read as tonight's. Sorted by date so
         # tonight lists first and tomorrow after it.
-        bd = [(str(r.date)[:10], f"{r.away} @ {r.home}",
+        def _day_tag(d_):
+            dd = pd.Timestamp(d_); rel = (dd.normalize() - today.normalize()).days
+            when = "Tonight" if rel <= 0 else ("Tomorrow" if rel == 1 else dd.strftime("%A"))
+            return when, dd.strftime("%a %b %-d")
+        bd = [(str(r.date)[:10], f"{r.away} @ {r.home} ({pd.Timestamp(r.date).strftime('%a')})",
                r.home if r.p_home >= .5 else r.away,
                max(r.p_home, 1 - r.p_home), r.game_id) for _, r in board.sort_values(["date", "game_id"]).iterrows()]
         wg = max([len(x[1]) for x in bd] + [10]); wp = max([len(x[2]) for x in bd] + [8])
+        _last_day = None
         for d_, gm, pk, q, gid in bd:
+            if d_ != _last_day:
+                # one header per day; notify renders "YYYY-MM-DD  text" as a bold heading
+                when, nice = _day_tag(d_); n_day = sum(1 for x in bd if x[0] == d_)
+                push[f"day:{d_}"] = {"line": f"{d_}  {when}, {nice}: {n_day} game{'s' if n_day != 1 else ''}", "min_odds": None, "match": None}
+                _last_day = d_
             if gate_open and BF.min_odds(q) < BF.PRICE_FLOOR:
                 skipped += 1
                 continue
