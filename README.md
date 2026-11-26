@@ -4,7 +4,9 @@ Standalone predictive model, no market inputs. Winner head only: P(home win incl
 OT/SO), matching the 2-way moneyline, no pushes. The totals head failed validation
 (two-thousandths of a goal over a constant) and is permanently benched.
 Frozen through 2025-26; 2026-27 is the forward test.
-Holdouts: 2024-25 LL 0.6613, 2025-26 LL 0.6821, clearing Elo and base both years.
+Holdouts: 2024-25 LL 0.6617, 2025-26 LL 0.6841, clearing Elo (0.6673, 0.6889) and base both
+years. These are the projected-starter engine that runs live, regenerated 2026-11-26; the
+0.6613 / 0.6821 shown before came from the build that knew the actual starting goalie.
 
 ## v2: the overtime coin flip is modelled, not absorbed
 
